@@ -930,7 +930,122 @@ class FusedMoE(torch.nn.Module):
 
         return s
 
+class HybridFusedMoE(FusedMoE):
+    """HybridFusedMoE layer for MoE models.
 
+    This layer contains both MergedColumnParallel weights (gate_up_proj /
+    w13) and RowParallelLinear weights (down_proj/ w2).
+
+    Note: Mixtral uses w1, w2, and w3 for gate, up, and down_proj. We
+    copy that naming convention here and handle any remapping in the
+    load_weights function in each model implementation.
+
+    Args:
+        num_experts: Number of experts in the model
+        top_k: Number of experts selected for each token
+        hidden_size: Input hidden state size of the transformer
+        intermediate_size: Intermediate size of the experts
+        params_dtype: Data type for the parameters.
+        reduce_results: Whether to all all_reduce on the output of the layer
+        renomalize: Whether to renormalize the logits in the fused_moe kernel
+        quant_config: Quantization configure.
+    """
+
+    input_tensor_cpu:torch.Tensor = None
+    output_tensor_cpu:torch.Tensor = None
+    topk_ids_tensor_cpu:torch.Tensor = None
+    topk_weights_tensor_cpu:torch.Tensor = None
+
+    def __init__(
+        self,
+        num_experts: int,  # Global number of experts
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: Optional[torch.dtype] = None,
+        reduce_results: bool = False,
+        renormalize: bool = True,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        tp_size: Optional[int] = None,
+        ep_size: Optional[int] = None,
+        dp_size: Optional[int] = None,
+        prefix: str = "",
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+        device: Optional[torch.device] = torch.device('cpu'),
+        expert_cuda_idx: Optional[torch.tensor] = torch.tensor([1]),
+    ):
+        super().__init__(num_experts, top_k, hidden_size, intermediate_size, params_dtype, reduce_results,
+                    renormalize, use_grouped_topk, num_expert_group, topk_group, quant_config, tp_size,
+                    ep_size, dp_size, prefix, custom_routing_function, scoring_func,
+                    e_score_correction_bias, activation)
+
+        self.num_experts = num_experts
+        self.expert_cuda_idx = expert_cuda_idx
+
+        import moe_cpu_engine as engine
+
+        # Initialize MOEConfig for moe_cpu_engine
+
+        # moe_param_layer_id in MOEConfig use to load_balance, which is not used now, so it is fixed first, and the parameter is not necessarily retained subsequently
+        # moe_param_* parameter is not used in the current implementation, just for compatibility
+        moe_param_layer_id = 3 # for debug, API infterface maybe delete this parameter
+        moe_param_normTopKProb = False # not used, just for compatibility
+        moe_param_nGroup = 1 #  not used, just for compatibility
+        moe_param_topKGroup = 1 #  not used, just for compatibility
+        #moe_config = engine.moe.MOEConfig(moe_param_layer_id, num_experts, top_k)
+        moe_config = engine.moe.MOEConfig(moe_param_layer_id, num_experts, top_k, hidden_size, intermediate_size, moe_param_normTopKProb, moe_param_nGroup, moe_param_topKGroup)
+
+        # Create an instance of moe_cpu_engine.moe.MOE
+        self.moe = engine.moe.MOE(moe_config)
+
+        # Initialize CPUInfer and MOE
+        self.cpu_infer = engine.CPUInfer(0)
+
+        # tensors used by moe_cpu_engine decoding stage
+        batch_size = 1
+
+        self.input_tensor_cpu = torch.zeros((batch_size, hidden_size), device="cpu", dtype=torch.bfloat16, pin_memory=True)
+        self.output_tensor_cpu = torch.zeros((batch_size, hidden_size), device="cpu", dtype=torch.bfloat16, pin_memory=True)
+        self.topk_ids_tensor_cpu = torch.zeros((batch_size, 8), device="cpu", dtype=torch.int32, pin_memory=True)
+        self.topk_weights_tensor_cpu = torch.zeros((batch_size, 8), device="cpu", dtype=torch.float32, pin_memory=True)
+
+        self.target_device = device
+
+    def process_weights_after_loading(self, layer: torch.nn.Module,indices:torch.tensor=None) -> None:
+        """
+        move 4 Experts to GPU, and the rest experts to CPU
+        """
+
+        num_experts = self.num_experts
+        indices = self.expert_cuda_idx.to("cpu") if indices is None else indices.to("cpu")
+
+        self.expert_cuda_map = torch.full((num_experts, ), -1, dtype=torch.int32)
+        self.expert_cuda_map [indices] = torch.arange(indices.shape[0], dtype=torch.int32)
+        self.expert_cuda_map = torch.tensor(self.expert_cuda_map).to("cuda")
+
+
+        self.w13_weight_cuda = layer.w13_weight.view(torch.int8)[indices].to("cuda").view(dtype=torch.float8_e4m3fn) 
+        self.w2_weight_cuda = layer.w2_weight.view(torch.int8)[indices].to("cuda").view(dtype=torch.float8_e4m3fn)
+
+        self.w13_weight_scale_inv_cuda = layer.w13_weight_scale_inv[indices].to("cuda")
+        self.w2_weight_scale_inv_cuda = layer.w2_weight_scale_inv[indices].to("cuda")
+
+        self.w13_weight_scale_inv_cpu = layer.w13_weight_scale_inv.to("cpu")
+        self.w2_weight_scale_inv_cpu = layer.w2_weight_scale_inv.to("cpu")
+
+        self.moe.set_weights(self.w13_weight.data_ptr(), self.w2_weight.data_ptr(), self.w13_weight_scale_inv_cpu.data_ptr(), self.w2_weight_scale_inv_cpu.data_ptr(), 0)
+
+        del self.w13_weight
+        del self.w2_weight
+        print("Finished expert weight movement for GPU")
+        return
+        
 def moe_forward(hidden_states: torch.Tensor, router_logits: torch.Tensor,
                 layer_name: str) -> torch.Tensor:
     forward_context: ForwardContext = get_forward_context()

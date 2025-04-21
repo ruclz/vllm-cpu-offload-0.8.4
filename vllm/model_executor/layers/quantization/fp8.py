@@ -12,7 +12,7 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEMethodBase,
+from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEMethodBase, HybridFusedMoE,
                                                   FusedMoeWeightScaleSupported)
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                UnquantizedLinearMethod)
@@ -121,6 +121,8 @@ class Fp8Config(QuantizationConfig):
                                 fused_mapping=self.packed_modules_mapping):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
+        elif isinstance(layer, HybridFusedMoE):
+            return HybridFp8MoEMethod(self)
         elif isinstance(layer, FusedMoE):
             return Fp8MoEMethod(self)
         elif isinstance(layer, Attention):
@@ -811,13 +813,312 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w1_scale=(layer.w13_weight_scale_inv
                       if self.block_quant else layer.w13_weight_scale),
             w2_scale=(layer.w2_weight_scale_inv
-                      if self.block_quant else layer.w2_weight_scale),
-            a1_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-            block_shape=self.quant_config.weight_block_size,
-            allow_deep_gemm=self.allow_deep_gemm,
-        )
+                     if self.block_quant else layer.w2_weight_scale),
+           a1_scale=layer.w13_input_scale,
+           a2_scale=layer.w2_input_scale,
+           block_shape=self.quant_config.weight_block_size,
+           allow_deep_gemm=self.allow_deep_gemm,
+       )
+class HybridFp8MoEMethod(Fp8MoEMethod):
+    """Hybrid MoE method for FP8.
+    Supports loading FP8 checkpoints with static weight scale and
+    dynamic/static activation scale.
 
+    Also supports loading quantized FP16/BF16 model checkpoints with dynamic
+    activation scaling. The weight scaling factor will be initialized after
+    the model weights are loaded.
+
+    Args:
+        quant_config: The quantization config.
+    """
+
+    def __init__(self, quant_config: Fp8Config):
+        super().__init__(quant_config)
+
+    def create_weights(self, layer: Module, num_experts: int, hidden_size: int,
+                       intermediate_size_per_partition: int,
+                       params_dtype: torch.dtype, **extra_weight_attrs):
+        if self.quant_config.is_checkpoint_fp8_serialized:
+            params_dtype = torch.float8_e4m3fn
+        if self.block_quant:
+            assert self.quant_config.weight_block_size is not None
+            tp_size = get_tensor_model_parallel_world_size()
+            block_n, block_k = (
+                self.quant_config.weight_block_size[0],
+                self.quant_config.weight_block_size[1],
+            )
+            # NOTE: To ensure proper alignment of the block-wise quantization
+            # scales, the output_size of the weights for both the gate and up
+            # layers must be divisible by block_n.
+            # Required by column parallel or enabling merged weights
+            if intermediate_size_per_partition % block_n != 0:
+                raise ValueError(
+                    f"The output_size of gate's and up's weight = "
+                    f"{intermediate_size_per_partition} is not divisible by "
+                    f"weight quantization block_n = {block_n}.")
+            if (tp_size > 1
+                    and intermediate_size_per_partition % block_k != 0):
+                # Required by row parallel
+                raise ValueError(
+                    f"The input_size of down's weight = "
+                    f"{intermediate_size_per_partition} is not divisible by "
+                    f"weight quantization block_k = {block_k}.")
+
+        # WEIGHTS
+        w13_weight = torch.nn.Parameter(torch.empty(
+            num_experts,
+            2 * intermediate_size_per_partition,
+            hidden_size,
+            device="cpu",
+            dtype=params_dtype),
+                                        requires_grad=False)
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(torch.empty(
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            device="cpu",
+            dtype=params_dtype),
+                                       requires_grad=False)
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # WEIGHT_SCALES
+        if not self.block_quant:
+            # Allocate 2 scales for w1 and w3 respectively.
+            # They will be combined to a single scale after weight loading.
+            w13_weight_scale = torch.nn.Parameter(torch.ones(
+                num_experts, 2, dtype=torch.float32),
+                                                  requires_grad=False)
+            w2_weight_scale = torch.nn.Parameter(torch.ones(
+                num_experts, dtype=torch.float32),
+                                                 requires_grad=False)
+            layer.register_parameter("w13_weight_scale", w13_weight_scale)
+            layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        else:
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    2 * ((intermediate_size_per_partition + block_n - 1) //
+                         block_n),
+                    (hidden_size + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    (hidden_size + block_n - 1) // block_n,
+                    (intermediate_size_per_partition + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+            layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+            assert self.quant_config.activation_scheme == "dynamic"
+
+        # Add the quantization method used (per tensor/grouped/channel)
+        # to ensure the weight scales are loaded in properly
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.
+             value} if self.block_quant else
+            {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value})
+        # If loading fp8 checkpoint, pass the weight loaders.
+        # If loading an fp16 checkpoint, do not (we will quantize in
+        #   process_weights_after_loading()
+
+
+        if self.quant_config.is_checkpoint_fp8_serialized:
+            set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+            set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        # INPUT_SCALES
+        if self.quant_config.activation_scheme == "static":
+            if not self.quant_config.is_checkpoint_fp8_serialized:
+                raise ValueError(
+                    "Found static activation scheme for checkpoint that "
+                    "was not serialized fp8.")
+
+            w13_input_scale = torch.nn.Parameter(torch.ones(
+                num_experts, dtype=torch.float32),
+                                                 requires_grad=False)
+            layer.register_parameter("w13_input_scale", w13_input_scale)
+            set_weight_attrs(w13_input_scale, extra_weight_attrs)
+
+            w2_input_scale = torch.nn.Parameter(torch.ones(
+                num_experts, dtype=torch.float32),
+                                                requires_grad=False)
+            layer.register_parameter("w2_input_scale", w2_input_scale)
+            set_weight_attrs(w2_input_scale, extra_weight_attrs)
+
+        else:
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
+    def split_topk_by_expert_cuda_idx_2d(self, topk_ids, topk_weights, expert_cuda_idx):
+        """
+        CUDA Graph compatible version： compute the intersection of topk_ids and expert_cuda_idx, padding the rest
+        
+        arguments:
+            topk_ids (torch.Tensor): (N, M)  top-k IDs
+            topk_weights (torch.Tensor): (N, M)  top-k weights
+            expert_cuda_idx (torch.Tensor): (K,)  experts id on CUDA
+        
+        return:
+            padded_cuda_ids, padded_cuda_weights, padded_cpu_ids, padded_cpu_weights
+        """
+        assert topk_ids.ndim == 2 and topk_weights.ndim == 2, "Inputs must be 2D tensors"
+        assert topk_ids.shape == topk_weights.shape, "Shape mismatch"
+        assert expert_cuda_idx.ndim == 1, "expert_cuda_idx must be 1D"
+
+        N, M = topk_ids.shape
+        device = topk_ids.device
+
+        # [N, M, 1] == [K] -> [N, M, K] -> any(dim=-1) -> [N, M]
+        mask_in_cuda = (topk_ids.unsqueeze(-1) == expert_cuda_idx).any(dim=-1)
+
+        # split CUDA and CPU
+        padded_cuda_ids = torch.where(mask_in_cuda, topk_ids, 0)
+        padded_cuda_weights = torch.where(mask_in_cuda, topk_weights, 0)
+        
+        padded_cpu_ids = torch.where(~mask_in_cuda, topk_ids, -1)
+        padded_cpu_weights = torch.where(~mask_in_cuda, topk_weights, 0)
+
+        # method 2（revision：convert bool to long, then sort it）
+        if True:
+            # get the non-zero elements for CUDA
+            cuda_counts = mask_in_cuda.sum(dim=1, keepdim=True)  # [N, 1]
+            
+            # generate index：convert bool to long, then sort it
+            sort_cpu_indices = torch.argsort(~mask_in_cuda.to(torch.int8), dim=1, stable=True, descending=True)
+            sort_cuda_indices = torch.argsort(mask_in_cuda.to(torch.int8), dim=1, stable=True, descending=True)
+            
+            # gather the results
+            padded_cuda_ids = torch.gather(padded_cuda_ids, 1, sort_cuda_indices)
+            padded_cuda_weights = torch.gather(padded_cuda_weights, 1, sort_cuda_indices)
+            padded_cpu_ids = torch.gather(padded_cpu_ids, 1, sort_cpu_indices)
+            padded_cpu_weights = torch.gather(padded_cpu_weights, 1, sort_cpu_indices)
+
+        return padded_cuda_ids, padded_cuda_weights, padded_cpu_ids, padded_cpu_weights
+    
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+    ) -> torch.Tensor:
+        import copy
+        from vllm.model_executor.layers.fused_moe import fused_experts
+        topk_weights, topk_ids = HybridFusedMoE.select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+        )
+        topk_cuda_ids, topk_cuda_weights, \
+            topk_cpu_ids, topk_cpu_weights = self.split_topk_by_expert_cuda_idx_2d(
+            topk_ids, 
+            topk_weights,
+            layer.expert_cuda_idx)
+
+        hidden_states_cpu = torch.zeros_like(x)
+        if x.shape[0] == 1 and torch.cuda.is_current_stream_capturing():
+            # Prepare input and output tensors for CPU computation
+            layer.input_tensor_cpu.copy_(x, non_blocking=True)
+            layer.topk_ids_tensor_cpu.copy_(topk_cpu_ids, non_blocking=True)
+            layer.topk_weights_tensor_cpu.copy_(topk_cpu_weights, non_blocking=True)
+            layer.cpu_infer.submit_with_cuda_stream(
+                torch.cuda.current_stream().cuda_stream,
+                layer.moe.forward_experts(
+                    layer.input_tensor_cpu.data_ptr(),
+                    layer.topk_ids_tensor_cpu.data_ptr(),
+                    layer.topk_weights_tensor_cpu.data_ptr(),
+                    layer.output_tensor_cpu.data_ptr(),
+                    layer.input_tensor_cpu.shape[0]
+                )
+            )
+            layer.cpu_infer.sync_with_cuda_stream(torch.cuda.current_stream().cuda_stream)
+            hidden_states_cpu.copy_(layer.output_tensor_cpu, non_blocking=True)
+        else:
+            # Prepare input and output tensors for CPU computation
+            input_tensor = x.contiguous().to("cpu")
+            hidden_states_cpu = hidden_states_cpu.to("cpu")
+            topk_cpu_ids_cpu = topk_cpu_ids.to('cpu')
+            topk_cpu_weights_cpu = topk_cpu_weights.to('cpu')
+            layer.cpu_infer.submit(
+                layer.moe.forward_experts(
+                    input_tensor.data_ptr(),
+                    topk_cpu_ids_cpu.data_ptr(),
+                    topk_cpu_weights_cpu.data_ptr(),
+                    hidden_states_cpu.data_ptr(),
+                    input_tensor.shape[0]
+                )
+            )
+            layer.cpu_infer.sync()
+            hidden_states_cpu = hidden_states_cpu.to(x.device)
+
+        #x_cuda=copy.deepcopy(x)
+        hidden_states_gpu = fused_experts(
+              x,
+              layer.w13_weight_cuda,
+              layer.w2_weight_cuda,
+              topk_weights=topk_cuda_weights, 
+              topk_ids=topk_cuda_ids,        
+              inplace=False,
+              activation=activation,
+              use_fp8_w8a8=True,
+              global_num_experts=global_num_experts,
+              expert_map=layer.expert_cuda_map,
+              w1_scale=(layer.w13_weight_scale_inv_cuda
+                      if self.block_quant else layer.w13_weight_scale),
+              w2_scale=(layer.w2_weight_scale_inv_cuda
+                      if self.block_quant else layer.w2_weight_scale),
+              a1_scale=layer.w13_input_scale,
+              a2_scale=layer.w2_input_scale,
+              block_shape=self.quant_config.weight_block_size,
+        )
+        # for verify
+        # hidden_states_verify=fused_experts(
+        #       x,
+        #       layer.w13_weight.to("cuda"),
+        #       layer.w2_weight.to("cuda"),
+        #       topk_weights=topk_weights, 
+        #       topk_ids=topk_ids,        
+        #       inplace=True,
+        #       activation=activation,
+        #       use_fp8_w8a8=True,
+        #       global_num_experts=global_num_experts,
+        #       expert_map=expert_map,
+        #       w1_scale=(layer.w13_weight_scale_inv
+        #               if self.block_quant else layer.w13_weight_scale),
+        #       w2_scale=(layer.w2_weight_scale_inv
+        #               if self.block_quant else layer.w2_weight_scale),
+        #       a1_scale=layer.w13_input_scale,
+        #       a2_scale=layer.w2_input_scale,
+        #       block_shape=self.quant_config.weight_block_size,
+        # )
+
+        return  hidden_states_gpu + hidden_states_cpu
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):
     """

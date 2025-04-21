@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
 from vllm.model_executor.layers.fused_moe.layer import (
-    FusedMoE, FusedMoEMethodBase, FusedMoeWeightScaleSupported)
+    FusedMoE, FusedMoEMethodBase,HybridFusedMoE, FusedMoeWeightScaleSupported)
 from vllm.triton_utils import HAS_TRITON
 
 _config: Optional[Dict[str, Any]] = None
@@ -27,6 +27,7 @@ __all__ = [
     "FusedMoE",
     "FusedMoEMethodBase",
     "FusedMoeWeightScaleSupported",
+    "HybridFusedMoE",
     "override_config",
     "get_config",
 ]

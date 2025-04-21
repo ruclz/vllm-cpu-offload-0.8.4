@@ -27,6 +27,7 @@ from transformers import AutoModelForCausalLM
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from vllm.attention import Attention
+from vllm.model_executor.layers.fused_moe.layer import  HybridFusedMoE
 from vllm.config import (LoadConfig, LoadFormat, ModelConfig, ParallelConfig,
                          VllmConfig, set_current_vllm_config)
 from vllm.distributed import (get_tensor_model_parallel_rank,
@@ -176,7 +177,8 @@ def _process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
             # to be on the global target device. This scope is for the
             # case where cpu offloading is used, where we will move the
             # parameters onto device for processing and back off after.
-            with device_loading_context(module, target_device):
+            tgt_device = getattr(module, "target_device", target_device)
+            with device_loading_context(module, tgt_device):
                 quant_method.process_weights_after_loading(module)
 
     # Currently only used by MLA.
@@ -188,6 +190,9 @@ def _process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
             # TODO(lucas): see if there is a way to unify the signatures
             # of process_weights_after_loading
             module.process_weights_after_loading(model_config.dtype)
+        if isinstance(module, HybridFusedMoE) and \
+            hasattr(module, "process_weights_after_loading"):
+            module.process_weights_after_loading(module)
 
 
 class BaseModelLoader(ABC):
@@ -205,7 +210,6 @@ class BaseModelLoader(ABC):
     def load_model(self, *, vllm_config: VllmConfig) -> nn.Module:
         """Load a model with the given configurations."""
         raise NotImplementedError
-
 
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
@@ -437,6 +441,43 @@ class DefaultModelLoader(BaseModelLoader):
         for source in secondary_weights:
             yield from self._get_weights_iterator(source)
 
+    def _get_first_four_weights(
+        self,
+        model_config: ModelConfig,
+        model: nn.Module,
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        count = 0
+        max_layers = 4
+
+        primary_weights = DefaultModelLoader.Source(
+            model_config.model,
+            model_config.revision,
+            prefix="",
+            fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
+            allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
+        )
+
+        for name, weight in self._get_weights_iterator(primary_weights):
+            if name.startswith("model.layers."):
+              layer_id = int(name.split(".")[2])
+              if layer_id >= max_layers:
+                  continue
+              # if layer_id >= max_layers:
+              #     continue
+            yield name, weight
+        secondary_weights = cast(
+            Iterable[DefaultModelLoader.Source],
+            getattr(model, "secondary_weights", ()),
+        )
+
+        for source in secondary_weights:
+            for name, weight in self._get_weights_iterator(source):
+              if name.startswith("model.layers."):
+                layer_id = int(name.split(".")[2])
+                if layer_id >= max_layers:
+                    continue
+              yield name, weight
+
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config.model,
                               model_config.revision,
@@ -453,7 +494,8 @@ class DefaultModelLoader(BaseModelLoader):
 
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
-                self.get_all_weights(model_config, model))
+                # self.get_all_weights(model_config, model))
+                self._get_first_four_weights(model_config, model))
             self.counter_after_loading_weights = time.perf_counter()
             logger.info(
                 "Loading weights took %.2f seconds",
