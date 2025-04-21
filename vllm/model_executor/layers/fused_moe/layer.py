@@ -859,6 +859,7 @@ class FusedMoE(torch.nn.Module):
                                                  cu_tokens_across_dp_cpu)
 
         # Matrix multiply.
+        #import pdb;pdb.set_trace()
         final_hidden_states = self.quant_method.apply(
             layer=self,
             x=hidden_states,
@@ -976,6 +977,7 @@ class HybridFusedMoE(FusedMoE):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
         activation: str = "silu",
         device: Optional[torch.device] = torch.device('cpu'),
         expert_cuda_idx: Optional[torch.tensor] = torch.tensor([1]),
@@ -983,7 +985,7 @@ class HybridFusedMoE(FusedMoE):
         super().__init__(num_experts, top_k, hidden_size, intermediate_size, params_dtype, reduce_results,
                     renormalize, use_grouped_topk, num_expert_group, topk_group, quant_config, tp_size,
                     ep_size, dp_size, prefix, custom_routing_function, scoring_func,
-                    e_score_correction_bias, activation)
+                    e_score_correction_bias, apply_router_weight_on_input, activation)
 
         self.num_experts = num_experts
         self.expert_cuda_idx = expert_cuda_idx
@@ -1021,20 +1023,20 @@ class HybridFusedMoE(FusedMoE):
         """
         move 4 Experts to GPU, and the rest experts to CPU
         """
+        if self.expert_cuda_idx is not None :
+          num_experts = self.num_experts
+          indices = self.expert_cuda_idx.to("cpu")
 
-        num_experts = self.num_experts
-        indices = self.expert_cuda_idx.to("cpu") if indices is None else indices.to("cpu")
-
-        self.expert_cuda_map = torch.full((num_experts, ), -1, dtype=torch.int32)
-        self.expert_cuda_map [indices] = torch.arange(indices.shape[0], dtype=torch.int32)
-        self.expert_cuda_map = torch.tensor(self.expert_cuda_map).to("cuda")
+          self.expert_cuda_map = torch.full((num_experts, ), -1, dtype=torch.int32)
+          self.expert_cuda_map [indices] = torch.arange(indices.shape[0], dtype=torch.int32)
+          self.expert_cuda_map = torch.tensor(self.expert_cuda_map).to("cuda")
 
 
-        self.w13_weight_cuda = layer.w13_weight.view(torch.int8)[indices].to("cuda").view(dtype=torch.float8_e4m3fn) 
-        self.w2_weight_cuda = layer.w2_weight.view(torch.int8)[indices].to("cuda").view(dtype=torch.float8_e4m3fn)
+          self.w13_weight_cuda = layer.w13_weight.view(torch.int8)[indices].to("cuda").view(dtype=torch.float8_e4m3fn) 
+          self.w2_weight_cuda = layer.w2_weight.view(torch.int8)[indices].to("cuda").view(dtype=torch.float8_e4m3fn)
 
-        self.w13_weight_scale_inv_cuda = layer.w13_weight_scale_inv[indices].to("cuda")
-        self.w2_weight_scale_inv_cuda = layer.w2_weight_scale_inv[indices].to("cuda")
+          self.w13_weight_scale_inv_cuda = layer.w13_weight_scale_inv[indices].to("cuda")
+          self.w2_weight_scale_inv_cuda = layer.w2_weight_scale_inv[indices].to("cuda")
 
         self.w13_weight_scale_inv_cpu = layer.w13_weight_scale_inv.to("cpu")
         self.w2_weight_scale_inv_cpu = layer.w2_weight_scale_inv.to("cpu")

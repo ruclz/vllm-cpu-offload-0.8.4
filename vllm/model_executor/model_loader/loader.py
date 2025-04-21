@@ -494,8 +494,8 @@ class DefaultModelLoader(BaseModelLoader):
 
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
-                # self.get_all_weights(model_config, model))
-                self._get_first_four_weights(model_config, model))
+                self.get_all_weights(model_config, model))
+                #self._get_first_four_weights(model_config, model))
             self.counter_after_loading_weights = time.perf_counter()
             logger.info(
                 "Loading weights took %.2f seconds",

@@ -222,7 +222,8 @@ class DeepseekV2HybridMoE(nn.Module):
             prefix=f"{prefix}.experts",
             scoring_func=config.scoring_func,
             e_score_correction_bias=self.gate.e_score_correction_bias,
-            expert_cuda_idx=torch.tensor([1]),
+            #expert_cuda_idx=torch.tensor([1]),
+            expert_cuda_idx=torch.tensor([1])
         )
 
         if config.n_shared_experts is not None:

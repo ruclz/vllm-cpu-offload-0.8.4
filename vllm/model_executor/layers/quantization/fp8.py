@@ -958,6 +958,7 @@ class HybridFp8MoEMethod(Fp8MoEMethod):
         else:
             layer.w13_input_scale = None
             layer.w2_input_scale = None
+
     def split_topk_by_expert_cuda_idx_2d(self, topk_ids, topk_weights, expert_cuda_idx):
         """
         CUDA Graph compatible version： compute the intersection of topk_ids and expert_cuda_idx, padding the rest
@@ -972,6 +973,10 @@ class HybridFp8MoEMethod(Fp8MoEMethod):
         """
         assert topk_ids.ndim == 2 and topk_weights.ndim == 2, "Inputs must be 2D tensors"
         assert topk_ids.shape == topk_weights.shape, "Shape mismatch"
+
+        if expert_cuda_idx is None : 
+            return None,None,topk_ids,topk_weights,False
+        
         assert expert_cuda_idx.ndim == 1, "expert_cuda_idx must be 1D"
 
         N, M = topk_ids.shape
@@ -991,6 +996,7 @@ class HybridFp8MoEMethod(Fp8MoEMethod):
         if True:
             # get the non-zero elements for CUDA
             cuda_counts = mask_in_cuda.sum(dim=1, keepdim=True)  # [N, 1]
+            has_gpu_ids = cuda_counts.sum().item() > 0
             
             # generate index：convert bool to long, then sort it
             sort_cpu_indices = torch.argsort(~mask_in_cuda.to(torch.int8), dim=1, stable=True, descending=True)
@@ -1002,7 +1008,7 @@ class HybridFp8MoEMethod(Fp8MoEMethod):
             padded_cpu_ids = torch.gather(padded_cpu_ids, 1, sort_cpu_indices)
             padded_cpu_weights = torch.gather(padded_cpu_weights, 1, sort_cpu_indices)
 
-        return padded_cuda_ids, padded_cuda_weights, padded_cpu_ids, padded_cpu_weights
+        return padded_cuda_ids, padded_cuda_weights, padded_cpu_ids, padded_cpu_weights, has_gpu_ids
     
     def apply(
         self,
@@ -1019,6 +1025,7 @@ class HybridFp8MoEMethod(Fp8MoEMethod):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
         activation: str = "silu",
     ) -> torch.Tensor:
         import copy
@@ -1036,7 +1043,7 @@ class HybridFp8MoEMethod(Fp8MoEMethod):
             e_score_correction_bias=e_score_correction_bias,
         )
         topk_cuda_ids, topk_cuda_weights, \
-            topk_cpu_ids, topk_cpu_weights = self.split_topk_by_expert_cuda_idx_2d(
+            topk_cpu_ids, topk_cpu_weights, has_gpu_ids = self.split_topk_by_expert_cuda_idx_2d(
             topk_ids, 
             topk_weights,
             layer.expert_cuda_idx)
@@ -1076,27 +1083,32 @@ class HybridFp8MoEMethod(Fp8MoEMethod):
             )
             layer.cpu_infer.sync()
             hidden_states_cpu = hidden_states_cpu.to(x.device)
+            final_hidden_states = hidden_states_cpu
 
-        #x_cuda=copy.deepcopy(x)
-        hidden_states_gpu = fused_experts(
-              x,
-              layer.w13_weight_cuda,
-              layer.w2_weight_cuda,
-              topk_weights=topk_cuda_weights, 
-              topk_ids=topk_cuda_ids,        
-              inplace=False,
-              activation=activation,
-              use_fp8_w8a8=True,
-              global_num_experts=global_num_experts,
-              expert_map=layer.expert_cuda_map,
-              w1_scale=(layer.w13_weight_scale_inv_cuda
-                      if self.block_quant else layer.w13_weight_scale),
-              w2_scale=(layer.w2_weight_scale_inv_cuda
-                      if self.block_quant else layer.w2_weight_scale),
-              a1_scale=layer.w13_input_scale,
-              a2_scale=layer.w2_input_scale,
-              block_shape=self.quant_config.weight_block_size,
-        )
+        # x_cuda=copy.deepcopy(x)
+        if has_gpu_ids :
+          hidden_states_gpu = fused_experts(
+                x,
+                layer.w13_weight_cuda,
+                layer.w2_weight_cuda,
+                topk_weights=topk_cuda_weights, 
+                topk_ids=topk_cuda_ids,        
+                inplace=True,
+                activation=activation,
+                use_fp8_w8a8=True,
+                global_num_experts=global_num_experts,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                expert_map=layer.expert_cuda_map,
+                w1_scale=(layer.w13_weight_scale_inv_cuda
+                        if self.block_quant else layer.w13_weight_scale),
+                w2_scale=(layer.w2_weight_scale_inv_cuda
+                        if self.block_quant else layer.w2_weight_scale),
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                block_shape=self.quant_config.weight_block_size,
+                allow_deep_gemm=self.allow_deep_gemm,
+          )
+          final_hidden_states = final_hidden_states + hidden_states_gpu
         # for verify
         # hidden_states_verify=fused_experts(
         #       x,
@@ -1108,6 +1120,7 @@ class HybridFp8MoEMethod(Fp8MoEMethod):
         #       activation=activation,
         #       use_fp8_w8a8=True,
         #       global_num_experts=global_num_experts,
+        #       apply_router_weight_on_input=apply_router_weight_on_input,
         #       expert_map=expert_map,
         #       w1_scale=(layer.w13_weight_scale_inv
         #               if self.block_quant else layer.w13_weight_scale),
@@ -1116,9 +1129,11 @@ class HybridFp8MoEMethod(Fp8MoEMethod):
         #       a1_scale=layer.w13_input_scale,
         #       a2_scale=layer.w2_input_scale,
         #       block_shape=self.quant_config.weight_block_size,
+        #       allow_deep_gemm=self.allow_deep_gemm,
         # )
-
-        return  hidden_states_gpu + hidden_states_cpu
+        # print ("test:",final_hidden_states)
+        # print ("verify:",hidden_states_verify)
+        return  final_hidden_states
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):
     """
